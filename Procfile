@@ -1,1 +1,1 @@
-web: python session.py
+web: python server.py
