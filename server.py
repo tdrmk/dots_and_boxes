@@ -3,14 +3,17 @@ import re
 import json
 import asyncio
 import websockets
+import os
 
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
 from websockets import WebSocketServerProtocol as WSConnection
 from websockets.exceptions import ConnectionClosedError
+from dots_and_boxes import Grid, Player, DotsAndBoxes, Edge, DotsAndBoxesException
 
 USERNAME_REGEX = r'^\w{4,9}$'
 PASSWORD_REGEX = r'^\w{4,9}$'
+HOST, PORT = '', os.environ.get('PORT', 8080)
 
 
 # Maintains user information
@@ -35,6 +38,7 @@ class User:
 
 
 # Persistently manages users
+# NOTE: Once user is created, cannot be deleted
 class UserManager:
     FILENAME = 'users.json'
 
@@ -110,7 +114,7 @@ class Session:
         print(f'Session expired {self._session_id} {self.user}')
 
     def disconnect(self):
-        # [Only] called when connection closes
+        # [Only] called when connection closes -> ABANDONED Session (ie, no connection)
         self._connection = None
         print(f'Session disconnected {self._session_id} {self.user}')
 
@@ -187,6 +191,131 @@ class SessionManager:
         # Returns False when no session or session hijack attempted
         return False
 
+    def live_session(self, user: User) -> Optional[Session]:
+        # Returns the active session of the user (if any)
+        # At most one active session per user
+        for session in self._sessions.values():
+            if session.user == user:
+                return session
+
+
+class Game:
+    TIMEOUT = 600
+    CLEAN_TIMEOUT = 60  # Time after which game is deleted after game over
+
+    def __init__(self, *users: User, grid=Grid(5, 5), session_manager: SessionManager):
+        self._game_id = secrets.token_hex()
+        self._grid = grid
+        self._sm = session_manager
+        self._users = users
+        self._players = [Game.player(user) for user in users]
+        # Can throw exception if invalid number of users
+        self._game = DotsAndBoxes(self._players, grid=grid)
+        self._active = True
+
+        # NOTE: Messages regarding game creation must be sent by the creator
+        # Remaining messages are sent!
+
+    # NOTE: All the methods updating state should only be triggered via game manager
+    def make_move(self, user: User, edge: Edge):
+        try:
+            self._game.make_move(Game.player(user), edge)
+        except DotsAndBoxesException:
+            raise
+        else:
+            # Send updated game to the (active) users if move is successful
+            # Note: sending the game updates the users if the game is over
+            for user in self._users:
+                session = self._sm.live_session(user)
+                if session and session.connection:
+                    # Send the game to active connections
+                    asyncio.create_task(Send.game(session.connection, self))
+
+    def expire(self):
+        # Expiry must only be triggered via Game Manager
+        self._active = False
+        for user in self._users:
+            session = self._sm.live_session(user)
+            if session and session.connection:
+                # Intimate the users about game expiry
+                asyncio.create_task(Send.game_expired(session.connection, self._game_id))
+
+    # GETTERS
+    @property
+    def session_status(self):
+        # Returns the session status of each of the users part of the game
+        statuses = []
+        for user in self._users:
+            session = self._sm.live_session(user)
+            if not session:
+                statuses.append('SESSION_EXPIRED')
+            elif session.connection:
+                statuses.append('SESSION_ABANDONED')
+            else:
+                statuses.append('SESSION_ACTIVE')
+        return statuses
+
+    @property
+    def expired(self):
+        return not self._active
+
+    @property
+    def game_id(self):
+        return self._game_id
+
+    @property
+    def data(self):
+        # Returns the serialized version of the game
+        return self._game.encode()
+
+    @property
+    def game_over(self):
+        return self._game.game_over
+
+    # Checks if user part of game
+    def __contains__(self, user: User):
+        return user in self._users
+
+    @staticmethod
+    def player(user: User):
+        return Player(user_id=user.user_id, username=user.username)
+
+
+class GameManager:
+    def __init__(self, session_manager):
+        self._games: Dict[str, Game] = {}
+        self._sm = session_manager
+
+    def __getitem__(self, game_id):
+        return self._games.get(game_id)
+
+    def create_game(self, *users: User, grid=Grid(5, 5)):
+        # Users can be part of multiple games, that are active
+        # Client must take of implementing necessary UI
+        game = Game(*users, grid=grid, session_manager=self._sm)
+        self._games[game.game_id] = game
+        # Schedule expiry of game after timeout
+        asyncio.get_event_loop().call_later(Game.TIMEOUT, self.expire_game, game.game_id)
+        return game
+
+    def make_move(self, game_id, user: User, edge: Edge):
+        game = self._games[game_id]
+        if game:
+            try:
+                game.make_move(user, edge)
+                if game.expired:
+                    # Schedule the clean up of the game
+                    asyncio.get_event_loop().call_later(Game.CLEAN_TIMEOUT, self.expire_game, game.game_id)
+            except DotsAndBoxesException:
+                raise
+
+    def expire_game(self, game_id):
+        # Game expiry can be triggered multiple times
+        game = self[game_id]
+        if game:
+            game.expire()
+            del self._games[game_id]
+
 
 # Sending messages
 class Send:
@@ -203,6 +332,7 @@ class Send:
     SIGNUP_FAILED = 'Sign up failed'
     LOGIN_FAILED = 'Login failed'
     CONNECTION_HIJACK = 'Connection hijack'
+    MULTIPLE_REQUESTS = 'Multiple requests'
 
     @staticmethod
     async def unauthenticated(websocket: WSConnection, reason: str):
@@ -218,14 +348,46 @@ class Send:
             'session_id': session_id,
         }))
 
+    @staticmethod
+    async def game(websocket: WSConnection, game: Game):
+        await websocket.send(json.dumps({
+            'type': 'GAME',
+            'game_id': game.game_id,
+            'game_data': game.data,
+            'player_status': game.session_status,
+        }))
 
-HOST, PORT = 'localhost', 8080
+    @staticmethod
+    async def game_expired(websocket: WSConnection, game_id):
+        await websocket.send(json.dumps({
+            'type': 'GAME_EXPIRED',
+            'session_id': game_id,
+        }))
+
+    # Unauthorized reasons
+    INVALID_USER = 'Invalid user'
+    GAME_EXCEPTION = 'Game exception'
+
+    @staticmethod
+    async def unauthorized(websocket: WSConnection, reason: str):
+        await websocket.send(json.dumps({
+            'type': 'UNAUTHORIZED',
+            'error': reason,
+        }))
 
 
 class Orchestrator:
+    NUM_PLAYERS = 2
+    GRID = Grid(5, 5)
+
     def __init__(self):
         self.user_manager = UserManager()
         self.session_manager = SessionManager()
+        self.game_manager = GameManager(self.session_manager)
+        # Connections waiting for sufficient players to join to start the game
+        # Map from connection to session_id.
+        # Note: Session could have expired, need to check before starting a game.
+        self._waiting_connections: Dict[WSConnection, str] = {}
 
     def sign_up(self, username, password, connection):
         existing_session = self.session_manager.active_session(connection)
@@ -278,8 +440,10 @@ class Orchestrator:
                     # Attempting hijack of active connection
                     raise UnauthenticatedException(Send.CONNECTION_HIJACK)
 
-    def status(self, session_id, connection):
-        # Returns session if session is live
+    def get_session(self, session_id, connection):
+        # Returns the active session identified by 'session_id' if session is Active (not expired)
+        # and is the active session on the connection
+        # However if INACTIVE connection, adopts the active session if session is in ABANDONED state (no connection)
         existing_session = self.session_manager.active_session(connection)
         if existing_session:
             if existing_session.session_id != session_id:
@@ -293,7 +457,7 @@ class Orchestrator:
                 raise SessionExpiredException(session_id)
             else:
                 if session.connection is None:
-                    # Adopt the session
+                    # Adopt the ABANDONED session (with no active connection)
                     self.session_manager.reconnect(session_id, connection)
                     return session
                 elif session.connection == connection:
@@ -303,11 +467,66 @@ class Orchestrator:
                     # Attempting hijack of active connection
                     raise UnauthenticatedException(Send.CONNECTION_HIJACK)
 
+    def join_game(self, session_id, connection):
+        session = self.get_session(session_id, connection)
+        if connection in self._waiting_connections:
+            # In case already a request is pending
+            raise UnauthenticatedException(Send.MULTIPLE_REQUESTS)
+
+        # Add the Existing session or the adopted session (session_id) into Waiting List
+        self._waiting_connections[connection] = session_id
+        for connection, session_id in list(self._waiting_connections.items()):
+            session = self.session_manager[session_id]
+            if not session:
+                # Expired session, need not notify connection
+                # Would have already been notified when session expired
+                del self._waiting_connections[connection]
+
+        if len(self._waiting_connections) == Orchestrator.NUM_PLAYERS:
+            # Enough active players that we can start the game
+            users = [self.session_manager[session_id].user for session_id in self._waiting_connections.values()]
+            game = self.game_manager.create_game(*users, grid=Orchestrator.GRID)
+            for connection in self._waiting_connections:
+                # Intimate the users waiting to join the new game!
+                asyncio.create_task(Send.game(connection, game))
+
+    def get_game(self, session_id, game_id, connection):
+        # Returns the corresponding game, if session and game is valid
+        session = self.get_session(session_id, connection)
+        game = self.game_manager[game_id]
+        if not game:
+            raise GameExpiredException(game_id)
+        elif session.user not in game:
+            raise UnauthorizedException(Send.INVALID_USER)
+
+        # User is part of game
+        return game
+
+    def make_move(self, session_id, game_id, edge: Edge, connection):
+        game = self.get_game(session_id, game_id, connection)
+        session = self.session_manager[session_id]
+        # Makes the move and sends the updated game to all the users
+        game.make_move(session.user, edge)
+
+    def exit_game(self, session_id, game_id, connection):
+        game = self.get_game(session_id, game_id, connection)
+        self.game_manager.expire_game(game.game_id)
+
     def unregister(self, connection):
+        # ABANDON the session using the connection, if any
         self.session_manager.unregister(connection)
+        # Remove from game waiting list
+        if connection in self._waiting_connections:
+            del self._waiting_connections[connection]
 
 
 class UnauthenticatedException(Exception):
+    def __init__(self, message):
+        self.message = message
+        super().__init__(message)
+
+
+class UnauthorizedException(Exception):
     def __init__(self, message):
         self.message = message
         super().__init__(message)
@@ -317,6 +536,12 @@ class SessionExpiredException(Exception):
     def __init__(self, session_id):
         self.session_id = session_id
         super().__init__(session_id)
+
+
+class GameExpiredException(Exception):
+    def __init__(self, game_id):
+        self.game_id = game_id
+        super().__init__(game_id)
 
 
 async def handler(websocket: WSConnection, _):
@@ -356,14 +581,82 @@ async def handler(websocket: WSConnection, _):
                     await Send.session_expired(websocket, session_id)
 
             elif data['type'] == 'STATUS':
+                # When connection is ACTIVE, returns status of existing session
+                # When connection is INACTIVE, can take over active ABANDONED session
+                # (ie, session with no connection), if available
+                # Simplest use case of request with `session_id`
                 session_id = data['session_id']
                 try:
-                    session = orchestrator.status(session_id, websocket)
+                    session = orchestrator.get_session(session_id, websocket)
                     await Send.authenticated(websocket, session)
                 except UnauthenticatedException as e:
                     await Send.unauthenticated(websocket, e.message)
                 except SessionExpiredException:
                     await Send.session_expired(websocket, session_id)
+
+            elif data['type'] == 'JOIN_GAME':
+                session_id = data['session_id']
+                try:
+                    # Adds Active Connection(session/connection) to waiting list till enough user has joined
+                    # Once enough Active Connections, game created using all those users and users are intimated
+                    orchestrator.join_game(session_id, websocket)
+                except UnauthenticatedException as e:
+                    await Send.unauthenticated(websocket, e.message)
+                except SessionExpiredException:
+                    await Send.session_expired(websocket, session_id)
+
+            elif data['type'] == 'GET_GAME':
+                session_id = data['session_id']
+                game_id = data['game_id']
+                try:
+                    # Makes sure session, game is valid and user (from session) is part of game
+                    # and returns the game (also adopts the session if ABANDONED)
+                    game = orchestrator.get_game(session_id, game_id, websocket)
+                    await Send.game(websocket, game)
+                except UnauthenticatedException as e:
+                    await Send.unauthenticated(websocket, e.message)
+                except SessionExpiredException:
+                    await Send.session_expired(websocket, session_id)
+                except UnauthorizedException as e:
+                    await Send.unauthorized(websocket, e.message)
+                except GameExpiredException:
+                    await Send.game_expired(websocket, game_id)
+
+            elif data['type'] == 'MAKE_MOVE':
+                session_id = data['session_id']
+                game_id = data['game_id']
+                edge = Edge.decode(data['edge_data'])
+                try:
+                    # Makes all the checks and actions of GET_GAME, and makes the move
+                    # and sends the latest game to all the active game connections
+                    orchestrator.make_move(session_id, game_id, edge, websocket)
+                except UnauthenticatedException as e:
+                    await Send.unauthenticated(websocket, e.message)
+                except SessionExpiredException:
+                    await Send.session_expired(websocket, session_id)
+                except UnauthorizedException as e:
+                    await Send.unauthorized(websocket, e.message)
+                except GameExpiredException:
+                    await Send.game_expired(websocket, game_id)
+                except DotsAndBoxesException:
+                    await Send.unauthorized(websocket, Send.GAME_EXCEPTION)
+
+            elif data['type'] == 'EXIT_GAME':
+                session_id = data['session_id']
+                game_id = data['game_id']
+                try:
+                    # Makes all the checks and actions of GET_GAME, and expires the move
+                    # and sends the game expired to all active connections
+                    orchestrator.exit_game(session_id, game_id, websocket)
+                except UnauthenticatedException as e:
+                    await Send.unauthenticated(websocket, e.message)
+                except SessionExpiredException:
+                    await Send.session_expired(websocket, session_id)
+                except UnauthorizedException as e:
+                    await Send.unauthorized(websocket, e.message)
+                except GameExpiredException:
+                    await Send.game_expired(websocket, game_id)
+
     except ConnectionClosedError:
         # Gracefully handle connection closure
         pass
