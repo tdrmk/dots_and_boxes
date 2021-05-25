@@ -249,7 +249,7 @@ class Game:
             session = self._sm.live_session(user)
             if not session:
                 statuses.append('SESSION_EXPIRED')
-            elif session.connection:
+            elif session.connection is None:
                 statuses.append('SESSION_ABANDONED')
             else:
                 statuses.append('SESSION_ACTIVE')
