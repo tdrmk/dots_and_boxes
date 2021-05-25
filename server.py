@@ -332,7 +332,6 @@ class Send:
     SIGNUP_FAILED = 'Sign up failed'
     LOGIN_FAILED = 'Login failed'
     CONNECTION_HIJACK = 'Connection hijack'
-    MULTIPLE_REQUESTS = 'Multiple requests'
 
     @staticmethod
     async def unauthenticated(websocket: WSConnection, reason: str):
@@ -365,6 +364,7 @@ class Send:
         }))
 
     # Unauthorized reasons
+    MULTIPLE_REQUESTS = 'Multiple requests'
     INVALID_USER = 'Invalid user'
     GAME_EXCEPTION = 'Game exception'
 
@@ -450,7 +450,7 @@ class Orchestrator:
         session = self.get_session(session_id, connection)
         if connection in self._waiting_connections:
             # In case already a request is pending
-            raise UnauthenticatedException(Send.MULTIPLE_REQUESTS)
+            raise UnauthorizedException(Send.MULTIPLE_REQUESTS)
 
         # Add the Existing session or the adopted session (session_id) into Waiting List
         self._waiting_connections[connection] = session_id
@@ -500,25 +500,38 @@ class Orchestrator:
 
 
 class UnauthenticatedException(Exception):
+    # Thrown when user try to create a new session or switch to another session on an ACTIVE connection
+    # or when login/signup fails or user tries to hijack a session (with ACTIVE connection)
     def __init__(self, message):
+        print(f'[UnauthenticatedException] {message}')
         self.message = message
         super().__init__(message)
 
 
 class UnauthorizedException(Exception):
+    # Thrown when user tries to access a game (identified by game_id) that user
+    # is not playing when on ACTIVE connection
+    # Or when user tries to send multiple game requests (not waiting for a game to started)
     def __init__(self, message):
+        print(f'[UnauthorizedException] {message}')
         self.message = message
         super().__init__(message)
 
 
 class SessionExpiredException(Exception):
+    # Thrown when requested session (identified by session_id) does not exist
+    # when on INACTIVE session (no session to ADOPT)
     def __init__(self, session_id):
+        print(f'[SessionExpiredException] session_id:{session_id}')
         self.session_id = session_id
         super().__init__(session_id)
 
 
 class GameExpiredException(Exception):
+    # Thrown when requested game (identified by game_id) does not exist
+    # when on ACTIVE connection
     def __init__(self, game_id):
+        print(f'[GameExpiredException] game_id:{game_id}')
         self.game_id = game_id
         super().__init__(game_id)
 
@@ -588,19 +601,14 @@ async def handler(websocket: WSConnection, _):
                     orchestrator.exit_game(session_id, game_id, websocket)
 
             except UnauthenticatedException as e:
-                # SIGN_UP, LOGIN, LOGOUT, STATUS, JOIN_GAME, GET_GAME, MAKE_MOVE, EXIT_GAME
                 await Send.unauthenticated(websocket, e.message)
             except SessionExpiredException as e:
-                # LOGOUT, STATUS, JOIN_GAME, GET_GAME, MAKE_MOVE, EXIT_GAME
                 await Send.session_expired(websocket, e.session_id)
             except UnauthorizedException as e:
-                # GET_GAME, MAKE_MOVE, EXIT_GAME
                 await Send.unauthorized(websocket, e.message)
             except GameExpiredException as e:
-                # GET_GAME, MAKE_MOVE, EXIT_GAME
                 await Send.game_expired(websocket, e.game_id)
-            except DotsAndBoxesException:
-                # MAKE_MOVE
+            except DotsAndBoxesException:  # MAKE_MOVE
                 await Send.unauthorized(websocket, Send.GAME_EXCEPTION)
 
     except ConnectionClosedError:

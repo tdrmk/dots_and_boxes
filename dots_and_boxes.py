@@ -195,7 +195,9 @@ class DotsAndBoxes(HexPickleSerializer):
 
 
 class DotsAndBoxesException(Exception):
+    # The exception is typically thrown when invalid move is made
+    # like, move after game over, invalid edge, or out of turn (or unknown) player
     def __init__(self, message):
         super().__init__(message)
-        print(f'Raised DotsAndBoxesException: {message}')
+        print(f'[DotsAndBoxesException] {message}')
         self.message = message
