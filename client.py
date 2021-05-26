@@ -1,11 +1,13 @@
 from dots_and_boxes import *
-from websockets import WebSocketClientProtocol as WSConnection
+from websockets import WebSocketClientProtocol as WSConnection, InvalidURI, InvalidStatusCode
 
 import pygame
 import asyncio
 import websockets
 import json
 import os
+import ssl
+import socket
 import argparse
 
 parser = argparse.ArgumentParser(description='Game client')
@@ -13,12 +15,14 @@ parser.add_argument('--username', type=str, default='username', help='Username')
 parser.add_argument('--password', type=str, default='password', help='Password')
 parser.add_argument('--uri', type=str, default='ws://localhost:8080', help='Server WebSocket URI')
 parser.add_argument("--signup", action="store_true", help="Sign up else login")
+parser.add_argument("--debug", action="store_false", help="Enable debug mode")
 args = parser.parse_args()
 
 URI = args.uri
 USERNAME = args.username
 PASSWORD = args.password
 SIGNUP = bool(args.signup)  # else LOGIN
+DEBUG = bool(args.debug)
 
 BACKGROUND = pygame.Color('#FFFFFF')
 FOREGROUND = pygame.Color('#000000')
@@ -106,7 +110,7 @@ class GameUI:
         # pygame and UI
         pygame.init()
         pygame.font.init()
-        self.width, self.height = 100 * game.grid.columns + 100, 100 * game.grid.rows + 150
+        self.width, self.height = 100 * game.grid.columns + 100, 100 * game.grid.rows + 200
 
         self.large_font = pygame.font.Font(None, 50)
         self.small_font = pygame.font.Font(None, 30)
@@ -120,11 +124,13 @@ class GameUI:
         self.run = False
 
     # Context manager
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
         pygame.quit()
+        if self.websocket and not self.websocket.closed:
+            await self.websocket.close()
 
     def draw(self):
         self.win.fill(BACKGROUND)
@@ -148,7 +154,10 @@ class GameUI:
         chosen_edges = self.game.chosen_edges_to_player
         for edge in self.edges:
             color = EDGE_DEFAULT
-            if edge.edge in chosen_edges:
+            if self.game.last_move == edge.edge:
+                # TODO: decide on the last move color/handling
+                color = FOREGROUND
+            elif edge.edge in chosen_edges:
                 player = chosen_edges[edge.edge]
                 color = self.color_util.primary(self.game.index(player))
             elif edge.collide(x, y):
@@ -197,22 +206,93 @@ class GameUI:
             self.win.blit(surf, rect)
             current_offset = rect.right + spacing
 
+        if self.player == self.game.current_player:
+            text = self.small_font.render(f"you're turn to move", True, FOREGROUND)
+        else:
+            text = self.small_font.render(f"wait for you're turn", True, FOREGROUND)
+        rect = text.get_rect()
+        rect.center = (self.width // 2, self.height - 100)
+        self.win.blit(text, rect)
+
     async def consume_messages(self):
         while self.run:
-            async for message in self.websocket:
-                response = json.loads(message)
-                # TODO: Handle all response types
-                if response['type'] == 'GAME':
-                    self.game_id = response['game_id']
-                    self.game: DotsAndBoxes = DotsAndBoxes.decode(response['game_data'])
-                    statuses = response['player_status']
-                    for player in self.game.players:
-                        self.connection_status[player] = statuses[self.game.index(player)]
-                elif response['type'] == 'GAME_EXPIRED':
-                    # Game expired
-                    self.game = None
+            try:
+                async for message in self.websocket:
+                    # Handle messages from active connection
+                    response = json.loads(message)
+
+                    if response['type'] == 'AUTHENTICATED':
+                        print("Authenticated!")
+                        # Update with the latest session_id, is update of user_id required?
+                        self.session_id = response['session_id']
+                        self.user_id = response['user_id']
+                        # Join back game
+                        asyncio.create_task(self.websocket.send(json.dumps({
+                            'type': 'GET_GAME',
+                            'session_id': self.session_id,
+                            'game_id': self.game_id,
+                        })))
+
+                    elif response['type'] == 'UNAUTHENTICATED':
+                        # TODO: What to do?
+                        print(f"Unauthenticated, reason: {response['error']}")
+
+                    elif response['type'] == 'SESSION_EXPIRED':
+                        session_id = response['session_id']
+                        if session_id == self.session_id:
+                            print("Session expired! attempting to login back")
+                            # Try logging it back
+                            asyncio.create_task(self.websocket.send(json.dumps({
+                                'type': 'LOGIN',
+                                'username': USERNAME,
+                                'password': PASSWORD,
+                            })))
+
+                    elif response['type'] == 'GAME':
+                        # TODO: Make sure to check if its the right game
+                        self.game_id = response['game_id']
+                        self.game: DotsAndBoxes = DotsAndBoxes.decode(response['game_data'])
+                        statuses = response['player_status']
+                        for player in self.game.players:
+                            self.connection_status[player] = statuses[self.game.index(player)]
+
+                    elif response['type'] == 'GAME_EXPIRED':
+                        if self.game_id == response['game_id']:
+                            # Make sure to check the game
+                            self.game = None
+
+                    elif response['type'] == 'PLAYER_STATUS':
+                        if self.game_id == response['game_id']:
+                            statuses = response['player_status']
+                            for player in self.game.players:
+                                self.connection_status[player] = statuses[self.game.index(player)]
+
+                    elif response['type'] == 'UNAUTHORIZED':
+                        # Quit game
+                        print(f"Unauthorized, reason: {response['error']}")
+            except asyncio.CancelledError:
+                raise
+
+            else:
+                print('Connection lost!')
+                if self.game and self.run:
+                    # If active game and user disconnects
+                    self.connection_status = {player: 'SESSION_ABANDONED' for player in self.game.players}
+                    # Try reconnecting..
+                    print('Trying to reconnect...')
+
+                    # If reconnection fails, exception is throw and loop breaks
+                    await asyncio.sleep(10)
+                    self.websocket = await websockets.connect(URI)
+                    await self.websocket.send(json.dumps({
+                        'type': 'LOGIN',
+                        'username': USERNAME,
+                        'password': PASSWORD,
+                    }))
+                    print('Reconnected successfully...')
+
                 else:
-                    print(response)
+                    return
 
     async def game_loop(self, interval=0.05):
         self.run = True
@@ -254,6 +334,18 @@ class GameUI:
                                             'game_id': self.game_id,
                                             'edge_data': edge.edge.encode(),
                                         })))
+                    # In case user is not sure if game is running or does not know status of the game
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                        asyncio.create_task(self.websocket.send(json.dumps({
+                            'type': 'GET_GAME',
+                            'session_id': self.session_id,
+                            'game_id': self.game_id,
+                        })))
+
+                    # For testing purposes
+                    if DEBUG and event.type == pygame.KEYDOWN and event.key == pygame.K_c:
+                        if self.websocket:
+                            asyncio.create_task(self.websocket.close())
 
             await asyncio.sleep(interval)
 
@@ -266,23 +358,51 @@ async def main():
         await websocket.send(json.dumps({'type': message_type, 'username': USERNAME, 'password': PASSWORD}))
         result = json.loads(await websocket.recv())
         if result['type'] == 'AUTHENTICATED':
+            # Establish session
             session_id = result['session_id']
             user_id = result['user_id']
 
+            print(f'User session created successfully user_id:{user_id} session_id:{session_id}')
             await websocket.send(json.dumps({'type': 'JOIN_GAME', 'session_id': session_id}))
-            result = json.loads(await websocket.recv())
 
-            if result['type'] == 'GAME':
-                game_id = result['game_id']
-                game = DotsAndBoxes.decode(result['game_data'])
-                with GameUI(game, websocket, session_id=session_id, game_id=game_id, user_id=user_id) as game_ui:
-                    await game_ui.game_loop()
-            else:
-                print(result)
+            print('WAITING FOR ENOUGH PLAYERS TO JOIN!')
+
+            while True:
+                result = json.loads(await websocket.recv())
+                if result['type'] == 'GAME':
+                    print('Starting game!')
+                    # Get the game details from server
+                    game_id = result['game_id']
+                    game = DotsAndBoxes.decode(result['game_data'])
+                    async with GameUI(game, websocket, session_id=session_id, game_id=game_id,
+                                      user_id=user_id) as game_ui:
+                        await game_ui.game_loop()
+                    break
+                elif result['type'] == 'SESSION_EXPIRED':
+                    print('Session expired! Try logging in again')
+                    break
+                else:
+                    # Ignore unknown messages
+                    print(f"Unexpected message: {result}")
+
+        elif result['type'] == 'UNAUTHENTICATED':
+            print(f"Authentication failed. Reason: {result['error']}")
+            print(f"If new user pass --signup flag, if existing user avoid it")
         else:
-            print(result)
+            print(f"Unexpected message: {result}")
+
+    except InvalidURI:
+        print("Invalid URI, please double check the URI")
+    except ssl.SSLCertVerificationError:
+        print("Certification verification failed. Please update your CA certificates.")
+        print("run `pip3 install --upgrade certifi`")
+    except InvalidStatusCode:
+        print("Server not found, please double check the URI")
+    except socket.gaierror:
+        print("Server not found, please double check the URI")
 
     finally:
+        # Game handles connection closure if game started.
         if websocket and not websocket.closed:
             await websocket.close()
 
