@@ -99,6 +99,8 @@ class DotsAndBoxes(HexPickleSerializer):
         self._chosen_edges: DefaultDict[Player, Set[Edge]] = defaultdict(set)
         # map from player to set of won boxes
         self._won_boxes: DefaultDict[Player, Set[Box]] = defaultdict(set)
+        # Last move (Useful in UI)
+        self._last_move: Edge = None
 
     def reset(self):
         # Reset the game state to initial
@@ -107,6 +109,7 @@ class DotsAndBoxes(HexPickleSerializer):
         self._pending_boxes = {box: 4 for box in Box.all_boxes(self._grid)}
         self._chosen_edges = defaultdict(set)
         self._won_boxes = defaultdict(set)
+        self._last_move = None
 
     def make_move(self, player: Player, edge: Edge):
         if self.game_over:
@@ -131,6 +134,7 @@ class DotsAndBoxes(HexPickleSerializer):
 
         if update_turn:
             self._turn = (self._turn + 1) % len(self._players)
+        self._last_move = edge
 
     @property
     def current_player(self):
@@ -170,6 +174,10 @@ class DotsAndBoxes(HexPickleSerializer):
     @property
     def pending_edges(self):
         return self._pending_edges
+
+    @property
+    def last_move(self):
+        return self._last_move
 
     @property
     def chosen_edges_to_player(self) -> Dict[Edge, Player]:
