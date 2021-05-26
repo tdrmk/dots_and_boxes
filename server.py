@@ -177,11 +177,12 @@ class SessionManager:
             if session.connection == connection:
                 return session
 
-    def unregister(self, connection: WSConnection):
+    def unregister(self, connection: WSConnection) -> Optional[Session]:
         # Called when connection is closed
         for session in self._sessions.values():
             if session.connection == connection:
                 session.disconnect()
+                return session
 
     def reconnect(self, session_id, connection: WSConnection):
         session = self[session_id]
@@ -213,6 +214,7 @@ class Game:
         self._game = DotsAndBoxes(self._players, grid=grid)
         self._active = True
 
+        print(f'Game created {self._game_id} Players: {self._players}')
         # NOTE: Messages regarding game creation must be sent by the creator
         # Remaining messages are sent!
 
@@ -239,6 +241,16 @@ class Game:
             if session and session.connection:
                 # Intimate the users about game expiry
                 asyncio.create_task(Send.game_expired(session.connection, self._game_id))
+
+        print(f'Game expired {self._game_id} Players: {self._players}')
+
+    def notify_status(self):
+        # Notifies the connection status of players
+        # to players with active connection
+        for user in self._users:
+            session = self._sm.live_session(user)
+            if session and session.connection:  # Sessions with connections
+                asyncio.create_task(Send.player_status(session.connection, self))
 
     # GETTERS
     @property
@@ -272,6 +284,10 @@ class Game:
     def game_over(self):
         return self._game.game_over
 
+    @property
+    def users(self):
+        return self._users
+
     # Checks if user part of game
     def __contains__(self, user: User):
         return user in self._users
@@ -303,7 +319,7 @@ class GameManager:
         if game:
             try:
                 game.make_move(user, edge)
-                if game.expired:
+                if game.game_over:
                     # Schedule the clean up of the game
                     asyncio.get_event_loop().call_later(Game.CLEAN_TIMEOUT, self.expire_game, game.game_id)
             except DotsAndBoxesException:
@@ -315,6 +331,14 @@ class GameManager:
         if game:
             game.expire()
             del self._games[game_id]
+
+    def notify_status(self, user: User):
+        # Trigger Status Notifications in all games user is part of
+        # Called on the account of player reconnecting back to game
+        # or disconnecting
+        for game in self._games.values():
+            if user in game.users:
+                game.notify_status()
 
 
 # Sending messages
@@ -357,10 +381,19 @@ class Send:
         }))
 
     @staticmethod
+    async def player_status(websocket: WSConnection, game: Game):
+        # Send connection status of players of game
+        await websocket.send(json.dumps({
+            'type': 'PLAYER_STATUS',
+            'game_id': game.game_id,
+            'player_status': game.session_status,
+        }))
+
+    @staticmethod
     async def game_expired(websocket: WSConnection, game_id):
         await websocket.send(json.dumps({
             'type': 'GAME_EXPIRED',
-            'session_id': game_id,
+            'game_id': game_id,
         }))
 
     # Unauthorized reasons
@@ -469,6 +502,9 @@ class Orchestrator:
                 # Intimate the users waiting to join the new game!
                 asyncio.create_task(Send.game(connection, game))
 
+            # No more waiting connections for a game
+            self._waiting_connections.clear()
+
     def get_game(self, session_id, game_id, connection):
         # Returns the corresponding game, if session and game is valid
         session = self.get_session(session_id, connection)
@@ -493,7 +529,13 @@ class Orchestrator:
 
     def unregister(self, connection):
         # ABANDON the session using the connection, if any
-        self.session_manager.unregister(connection)
+        session = self.session_manager.unregister(connection)
+        if session:
+            # If session was abandoned, notify all the players (with active connection)
+            # part of all games user is part of that player is disconnected
+            # NOTE: sends status of all players of a given game (not just disconnected player)
+            self.game_manager.notify_status(session.user)
+
         # Remove from game waiting list
         if connection in self._waiting_connections:
             del self._waiting_connections[connection]
@@ -584,6 +626,9 @@ async def handler(websocket: WSConnection, _):
                     # and returns the game (also adopts the session if ABANDONED)
                     game = orchestrator.get_game(session_id, game_id, websocket)
                     await Send.game(websocket, game)
+                    # In case user reconnected notify all other players (including itself)
+                    # WARNING: calling action outside orchestrator
+                    game.notify_status()
 
                 elif data['type'] == 'MAKE_MOVE':
                     session_id = data['session_id']
