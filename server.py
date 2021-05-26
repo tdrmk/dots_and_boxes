@@ -201,8 +201,14 @@ class SessionManager:
 
 
 class Game:
-    TIMEOUT = 600
-    CLEAN_TIMEOUT = 60  # Time after which game is deleted after game over
+    # length of time that game is idle before being eligible for expiry
+    # ie if time since last move is IDLE_TIMEOUT, game is expired
+    IDLE_TIMEOUT = 300  # 5 minutes
+    # maximum length of time the game can be alive (irrespective of user activity)
+    # ie Game is automatically expired after MAX_TIMEOUT after creation
+    MAX_TIMEOUT = 900  # 15 minutes
+    # length of time after which GAME is automatically deleted after game over
+    CLEAN_TIMEOUT = 120  # 2 minutes
 
     def __init__(self, *users: User, grid=Grid(5, 5), session_manager: SessionManager):
         self._game_id = secrets.token_hex()
@@ -302,6 +308,14 @@ class GameManager:
         self._games: Dict[str, Game] = {}
         self._sm = session_manager
 
+        # Map of timeout tasks associated with the game,
+        # if any of tasks completes, triggers expiry of game,
+        # which cancels all the (remaining) timeouts
+        self._idle_timeout_tasks: Dict[str, asyncio.Task] = {}
+        self._max_timeout_tasks: Dict[str, asyncio.Task] = {}
+        # Clean timeout is only populated on game expiry
+        self._clean_timeout_tasks: Dict[str, asyncio.Task] = {}
+
     def __getitem__(self, game_id):
         return self._games.get(game_id)
 
@@ -310,8 +324,12 @@ class GameManager:
         # Client must take of implementing necessary UI
         game = Game(*users, grid=grid, session_manager=self._sm)
         self._games[game.game_id] = game
-        # Schedule expiry of game after timeout
-        asyncio.get_event_loop().call_later(Game.TIMEOUT, self.expire_game, game.game_id)
+        # Schedule game expiry on idle and max timeouts
+        # Note: idle timeout expiry is reset when move is made
+        self._idle_timeout_tasks[game.game_id] = asyncio.create_task(
+            self._schedule_game_expiry(game.game_id, Game.IDLE_TIMEOUT, 'IDLE_TIMEOUT'))
+        self._max_timeout_tasks[game.game_id] = asyncio.create_task(
+            self._schedule_game_expiry(game.game_id, Game.MAX_TIMEOUT, 'MAX_TIMEOUT'))
         return game
 
     def make_move(self, game_id, user: User, edge: Edge):
@@ -319,11 +337,30 @@ class GameManager:
         if game:
             try:
                 game.make_move(user, edge)
+                # Reschedule idle timeout
+                self._update_idle_timeout(game_id)
                 if game.game_over:
                     # Schedule the clean up of the game
-                    asyncio.get_event_loop().call_later(Game.CLEAN_TIMEOUT, self.expire_game, game.game_id)
+                    self._clean_timeout_tasks[game_id] = asyncio.create_task(
+                        self._schedule_game_expiry(game_id, Game.CLEAN_TIMEOUT, 'CLEAN_TIMEOUT'))
             except DotsAndBoxesException:
                 raise
+
+    def _update_idle_timeout(self, game_id):
+        if self._games[game_id]:
+            # Cancel existing idle timeout, and reschedule new one.
+            self._idle_timeout_tasks[game_id].cancel()
+            self._idle_timeout_tasks[game_id] = asyncio.create_task(
+                self._schedule_game_expiry(game_id, Game.IDLE_TIMEOUT, 'IDLE_TIMEOUT'))
+
+    async def _schedule_game_expiry(self, game_id, timeout, name):
+        # Concurrently triggers game expiry after specified timeout
+        try:
+            await asyncio.sleep(timeout)
+            self.expire_game(game_id)
+            print(f'{name} timeout occurred. game_id: {game_id}')
+        except asyncio.CancelledError:  # expiry task was cancelled
+            raise
 
     def expire_game(self, game_id):
         # Game expiry can be triggered multiple times
@@ -332,10 +369,20 @@ class GameManager:
             game.expire()
             del self._games[game_id]
 
+            # Cancel all associated scheduled expiry events
+            self._idle_timeout_tasks[game_id].cancel()
+            self._max_timeout_tasks[game_id].cancel()
+            del self._idle_timeout_tasks[game_id]
+            del self._max_timeout_tasks[game_id]
+
+            if game_id in self._clean_timeout_tasks:
+                self._clean_timeout_tasks[game_id].cancel()
+                del self._clean_timeout_tasks[game_id]
+
     def notify_status(self, user: User):
-        # Trigger Status Notifications in all games user is part of
-        # Called on the account of player reconnecting back to game
-        # or disconnecting
+        # Sends player status message to all games user is part of
+        # Called when player (ie user) disconnects (connection closed)
+        # NOTE: Could potentially also be used on reconnect
         for game in self._games.values():
             if user in game.users:
                 game.notify_status()
@@ -521,7 +568,7 @@ class Orchestrator:
         game = self.get_game(session_id, game_id, connection)
         session = self.session_manager[session_id]
         # Makes the move and sends the updated game to all the users
-        game.make_move(session.user, edge)
+        self.game_manager.make_move(game.game_id, session.user, edge)
 
     def exit_game(self, session_id, game_id, connection):
         game = self.get_game(session_id, game_id, connection)
