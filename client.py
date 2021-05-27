@@ -15,7 +15,7 @@ parser.add_argument('--username', type=str, default='username', help='Username')
 parser.add_argument('--password', type=str, default='password', help='Password')
 parser.add_argument('--uri', type=str, default='ws://localhost:8080', help='Server WebSocket URI')
 parser.add_argument("--signup", action="store_true", help="Sign up else login")
-parser.add_argument("--debug", action="store_false", help="Enable debug mode")
+parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 args = parser.parse_args()
 
 URI = args.uri
@@ -52,6 +52,9 @@ class EdgeUI:
     def draw(self, win: pygame.Surface, color):
         pygame.draw.rect(win, color, self._rect)
 
+    def draw_highlight(self, win: pygame.Surface, color):
+        pygame.draw.rect(win, color, self._rect, 3)
+
     def collide(self, x, y):
         return self._rect.collidepoint(x, y)
 
@@ -77,12 +80,12 @@ class ColorUtil:
         self.total = total
 
     def secondary(self, index):
-        color = pygame.Color((255, 255, 255))
+        color = pygame.Color('#FFFFFF')
         color.hsva = 360 * index / self.total, 100, 100, 100
         return color
 
     def primary(self, index):
-        color = pygame.Color((255, 255, 255))
+        color = pygame.Color('#FFFFFF')
         color.hsva = 360 * index / self.total, 50, 50, 100
         return color
 
@@ -113,7 +116,8 @@ class GameUI:
         self.width, self.height = 100 * game.grid.columns + 100, 100 * game.grid.rows + 200
 
         self.large_font = pygame.font.Font(None, 50)
-        self.small_font = pygame.font.Font(None, 30)
+        self.medium_font = pygame.font.Font(None, 40)
+        self.small_font = pygame.font.Font(None, 25)
 
         self.win = pygame.display.set_mode((self.width, self.height))
         pygame.display.set_caption(f'Dots and Boxes [{USERNAME}]')
@@ -122,6 +126,10 @@ class GameUI:
         self.color_util = ColorUtil(self.game.num_players)
 
         self.run = False
+
+        # Stores true when new join_game request is sent, and waiting for response
+        # Set when initiating a new game request, and used to rate limit the request to 1
+        self.pending_new_request = False
 
     # Context manager
     async def __aenter__(self):
@@ -138,14 +146,58 @@ class GameUI:
             self._draw_game()
             self._draw_status()
             if self.game.game_over:
-                self._draw_text_screen_center('Game Over')
+                self._draw_game_over()
+        elif self.pending_new_request:
+            self._draw_waiting_new_game()
         else:
-            self._draw_text_screen_center('Game Expired')
+            self._draw_game_expired()
 
-    def _draw_text_screen_center(self, message):
-        text = self.large_font.render(message, True, FOREGROUND)
+    def _draw_game_over(self):
+        modal_rect = pygame.Rect(self.width // 4, self.height // 4, self.width // 2, self.height // 2)
+        pygame.draw.rect(self.win, BACKGROUND, modal_rect)
+        pygame.draw.rect(self.win, FOREGROUND, modal_rect, 2)
+
+        text = self.large_font.render("GAME OVER", True, FOREGROUND)
         text_rect = text.get_rect()
-        text_rect.center = self.width // 2, self.height // 2
+        text_rect.centerx, text_rect.centery = self.width // 2, self.height * 3 // 8
+        self.win.blit(text, text_rect)
+
+        winners = list(self.game.winners)
+        if len(winners) > 1:
+            text = self.medium_font.render("it's a tie", True, FOREGROUND)
+        else:
+            winner = winners[0]
+            text = self.medium_font.render(
+                f"{winner.username} won", True, self.color_util.primary(self.game.index(winner)))
+        text_rect = text.get_rect()
+        text_rect.centerx, text_rect.centery = self.width // 2, self.height // 2
+        self.win.blit(text, text_rect)
+
+        text = self.small_font.render('Press R for rematch', True, FOREGROUND)
+        text_rect = text.get_rect()
+        text_rect.centerx, text_rect.centery = self.width // 2, self.height * 2 // 3
+        self.win.blit(text, text_rect)
+
+        text = self.small_font.render('Press N for new game', True, FOREGROUND)
+        text_rect = text.get_rect()
+        text_rect.centerx, text_rect.top = self.width // 2, self.height * 2 // 3 + 20
+        self.win.blit(text, text_rect)
+
+    def _draw_game_expired(self):
+        text = self.large_font.render("GAME EXPIRED!", True, FOREGROUND)
+        text_rect = text.get_rect()
+        text_rect.centerx, text_rect.centery = self.width // 2, self.height * 3 // 7
+        self.win.blit(text, text_rect)
+
+        text = self.small_font.render('Press N for new game', True, FOREGROUND)
+        text_rect = text.get_rect()
+        text_rect.centerx, text_rect.top = self.width // 2, self.height * 2 // 3 + 20
+        self.win.blit(text, text_rect)
+
+    def _draw_waiting_new_game(self):
+        text = self.large_font.render("Waiting for new game!", True, FOREGROUND)
+        text_rect = text.get_rect()
+        text_rect.centerx, text_rect.centery = self.width // 2, self.height // 2
         self.win.blit(text, text_rect)
 
     def _draw_game(self):
@@ -154,16 +206,15 @@ class GameUI:
         chosen_edges = self.game.chosen_edges_to_player
         for edge in self.edges:
             color = EDGE_DEFAULT
-            if self.game.last_move == edge.edge:
-                # TODO: decide on the last move color/handling
-                color = FOREGROUND
-            elif edge.edge in chosen_edges:
+            if edge.edge in chosen_edges:
                 player = chosen_edges[edge.edge]
                 color = self.color_util.primary(self.game.index(player))
             elif edge.collide(x, y):
                 color = EDGE_HOVERED
 
             edge.draw(self.win, color)
+            if self.game.last_move == edge.edge:
+                edge.draw_highlight(self.win, FOREGROUND)
 
         won_boxes = self.game.won_boxes_to_player
         for box, player in won_boxes.items():
@@ -178,7 +229,7 @@ class GameUI:
             index, score, username = self.game.index(player), self.game.score(player), player.username
 
             # Render score
-            text = self.small_font.render(f"{username}: {score}", True, self.color_util.primary(index))
+            text = self.small_font.render(f"{username}: {score:02}", True, self.color_util.primary(index))
             text_rect = text.get_rect()
 
             # Construct a new surface which will contain score, connection status, and turn indicator
@@ -187,7 +238,7 @@ class GameUI:
             surf.fill(BACKGROUND)
             # Add a border to indicate turn
             if player == self.game.current_player:
-                pygame.draw.rect(surf, self.color_util.secondary(index), rect, width=2)
+                pygame.draw.rect(surf, self.color_util.secondary(index), rect, 2)
             # Add a status indicator
             status_color = ACTIVE if self.connection_status[player] == 'SESSION_ACTIVE' else INACTIVE
             pygame.draw.circle(surf, status_color, (20 + text_rect.h // 2, 20 + text_rect.h // 2), text_rect.h // 2)
@@ -206,7 +257,14 @@ class GameUI:
             self.win.blit(surf, rect)
             current_offset = rect.right + spacing
 
-        if self.player == self.game.current_player:
+        if self.game.game_over:
+            if len(self.game.winners) > 1:
+                text = self.small_font.render(f"it's a draw", True, FOREGROUND)
+            else:
+                winner = list(self.game.winners)[0]
+                index = self.game.index(winner)
+                text = self.small_font.render(f"{winner.username} won", True, self.color_util.primary(index))
+        elif self.player == self.game.current_player:
             text = self.small_font.render(f"you're turn to move", True, FOREGROUND)
         else:
             text = self.small_font.render(f"wait for you're turn", True, FOREGROUND)
@@ -215,6 +273,7 @@ class GameUI:
         self.win.blit(text, rect)
 
     async def consume_messages(self):
+        attempt_reconnect = False
         while self.run:
             try:
                 async for message in self.websocket:
@@ -236,6 +295,7 @@ class GameUI:
                     elif response['type'] == 'UNAUTHENTICATED':
                         # TODO: What to do?
                         print(f"Unauthenticated, reason: {response['error']}")
+                        self.run = False
 
                     elif response['type'] == 'SESSION_EXPIRED':
                         session_id = response['session_id']
@@ -250,18 +310,27 @@ class GameUI:
 
                     elif response['type'] == 'GAME':
                         # TODO: Make sure to check if its the right game
+                        print("Got game from server...")
                         self.game_id = response['game_id']
                         self.game: DotsAndBoxes = DotsAndBoxes.decode(response['game_data'])
                         statuses = response['player_status']
                         for player in self.game.players:
                             self.connection_status[player] = statuses[self.game.index(player)]
 
+                        # Reset this once a game is received
+                        self.pending_new_request = False
+
                     elif response['type'] == 'GAME_EXPIRED':
+                        print("Game expired!")
                         if self.game_id == response['game_id']:
                             # Make sure to check the game
                             self.game = None
 
+                        # Just in case, not sure if its required
+                        self.pending_new_request = False
+
                     elif response['type'] == 'PLAYER_STATUS':
+                        print("Updated player status...")
                         if self.game_id == response['game_id']:
                             statuses = response['player_status']
                             for player in self.game.players:
@@ -270,12 +339,17 @@ class GameUI:
                     elif response['type'] == 'UNAUTHORIZED':
                         # Quit game
                         print(f"Unauthorized, reason: {response['error']}")
+                        self.run = False
+            except websockets.exceptions.ConnectionClosedError:
+                print('Connection lost')
+                attempt_reconnect = True
+
             except asyncio.CancelledError:
+                attempt_reconnect = False
                 raise
 
-            else:
-                print('Connection lost!')
-                if self.game and self.run:
+            finally:
+                if self.game and self.run and attempt_reconnect:
                     # If active game and user disconnects
                     self.connection_status = {player: 'SESSION_ABANDONED' for player in self.game.players}
                     # Try reconnecting..
@@ -311,6 +385,7 @@ class GameUI:
                     if self.game and not self.game.game_over:
                         # If game is still running
                         # Send exit message to server
+                        print('Exiting the game...')
                         await self.websocket.send(json.dumps({
                             'type': 'EXIT_GAME',
                             'session_id': self.session_id,
@@ -325,6 +400,7 @@ class GameUI:
                             for edge in self.edges:
                                 if edge.collide(event.pos[0], event.pos[1]):
                                     if edge.edge in self.game.pending_edges:
+                                        print('Made a move...')
                                         # Make the move locally
                                         self.game.make_move(self.game.current_player, edge.edge)
                                         # Send the move to server
@@ -334,10 +410,21 @@ class GameUI:
                                             'game_id': self.game_id,
                                             'edge_data': edge.edge.encode(),
                                         })))
+
                     # In case user is not sure if game is running or does not know status of the game
-                    if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_l:
+                        print('synchronizing game from server...')
                         asyncio.create_task(self.websocket.send(json.dumps({
                             'type': 'GET_GAME',
+                            'session_id': self.session_id,
+                            'game_id': self.game_id,
+                        })))
+
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_e:
+                        # Exit Game, so that user can join new one
+                        print('exiting current game...')
+                        asyncio.create_task(self.websocket.send(json.dumps({
+                            'type': 'EXIT_GAME',
                             'session_id': self.session_id,
                             'game_id': self.game_id,
                         })))
@@ -346,6 +433,47 @@ class GameUI:
                     if DEBUG and event.type == pygame.KEYDOWN and event.key == pygame.K_c:
                         if self.websocket:
                             asyncio.create_task(self.websocket.close())
+
+                elif self.game and self.game.game_over and not self.pending_new_request:
+                    # Handle events when game over
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                        print('Resetting the game...')
+                        # Reset the game (new game with same player)
+                        asyncio.create_task(self.websocket.send(json.dumps({
+                            'type': 'RESET_GAME',
+                            'session_id': self.session_id,
+                            'game_id': self.game_id,
+                        })))
+                        # Also used while resetting game to prevent duplicate requests
+                        self.pending_new_request = True
+
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_n:
+                        # Exit existing game
+                        print('Exiting current game...')
+                        asyncio.create_task(self.websocket.send(json.dumps({
+                            'type': 'EXIT_GAME',
+                            'session_id': self.session_id,
+                            'game_id': self.game_id,
+                        })))
+                        # Join new game
+                        print('Sending join new game request...')
+                        asyncio.create_task(self.websocket.send(json.dumps({
+                            'type': 'JOIN_GAME',
+                            'session_id': self.session_id,
+                        })))
+
+                        self.pending_new_request = True
+
+                elif not self.game and not self.pending_new_request:
+                    # If game is expired
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_n:
+                        # Join new game
+                        print('Sending join new game request')
+                        asyncio.create_task(self.websocket.send(json.dumps({
+                            'type': 'JOIN_GAME',
+                            'session_id': self.session_id,
+                        })))
+                        self.pending_new_request = True
 
             await asyncio.sleep(interval)
 
@@ -408,4 +536,8 @@ async def main():
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # TODO: Close gracefully on exit
+        pass
