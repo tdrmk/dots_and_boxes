@@ -4,6 +4,7 @@ import json
 import asyncio
 import websockets
 import os
+import inspect
 
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
@@ -250,6 +251,18 @@ class Game:
 
         print(f'Game expired {self._game_id} Players: {self._players}')
 
+    def reset(self):
+        # Resets the game, ie, new game with same set of players
+        # Should only be triggered via Game Manager, to reset the timers
+        self._game.reset()
+        for user in self._users:
+            session = self._sm.live_session(user)
+            if session and session.connection:
+                # Intimate the users about game reset
+                asyncio.create_task(Send.game(session.connection, self))
+
+        print(f'Game reset {self._game_id} Players: {self._players}')
+
     def notify_status(self):
         # Notifies the connection status of players
         # to players with active connection
@@ -386,6 +399,23 @@ class GameManager:
         for game in self._games.values():
             if user in game.users:
                 game.notify_status()
+
+    def reset_game(self, game_id):
+        # Moves the game back to initial state (ie, new game) however with the same set of existing players
+        game = self[game_id]
+        if game:
+            game.reset()
+
+            # Cancel existing timeout tasks and create new one
+            self._idle_timeout_tasks[game_id].cancel()
+            self._max_timeout_tasks[game_id].cancel()
+            if game_id in self._clean_timeout_tasks:
+                self._clean_timeout_tasks[game_id].cancel()
+
+            self._idle_timeout_tasks[game.game_id] = asyncio.create_task(
+                self._schedule_game_expiry(game.game_id, Game.IDLE_TIMEOUT, 'IDLE_TIMEOUT'))
+            self._max_timeout_tasks[game.game_id] = asyncio.create_task(
+                self._schedule_game_expiry(game.game_id, Game.MAX_TIMEOUT, 'MAX_TIMEOUT'))
 
 
 # Sending messages
@@ -570,6 +600,10 @@ class Orchestrator:
         # Makes the move and sends the updated game to all the users
         self.game_manager.make_move(game.game_id, session.user, edge)
 
+    def reset_game(self, session_id, game_id, connection):
+        game = self.get_game(session_id, game_id, connection)
+        self.game_manager.reset_game(game.game_id)
+
     def exit_game(self, session_id, game_id, connection):
         game = self.get_game(session_id, game_id, connection)
         self.game_manager.expire_game(game.game_id)
@@ -588,41 +622,48 @@ class Orchestrator:
             del self._waiting_connections[connection]
 
 
-class UnauthenticatedException(Exception):
+class BaseServerException(Exception):
+    def __init__(self):
+        call_stack = inspect.stack()
+        self.lineno = call_stack[2].lineno
+        self.function = call_stack[2].function
+
+
+class UnauthenticatedException(BaseServerException):
     # Thrown when user try to create a new session or switch to another session on an ACTIVE connection
     # or when login/signup fails or user tries to hijack a session (with ACTIVE connection)
     def __init__(self, message):
-        print(f'[UnauthenticatedException] {message}')
+        super().__init__()
         self.message = message
-        super().__init__(message)
+        print(f'[{self.__class__.__name__}] reason:{message}  lineno:{self.lineno} func:{self.function}')
 
 
-class UnauthorizedException(Exception):
+class UnauthorizedException(BaseServerException):
     # Thrown when user tries to access a game (identified by game_id) that user
     # is not playing when on ACTIVE connection
     # Or when user tries to send multiple game requests (not waiting for a game to started)
     def __init__(self, message):
-        print(f'[UnauthorizedException] {message}')
+        super().__init__()
         self.message = message
-        super().__init__(message)
+        print(f'[{self.__class__.__name__}] reason:{message} lineno:{self.lineno} func:{self.function}')
 
 
-class SessionExpiredException(Exception):
+class SessionExpiredException(BaseServerException):
     # Thrown when requested session (identified by session_id) does not exist
     # when on INACTIVE session (no session to ADOPT)
     def __init__(self, session_id):
-        print(f'[SessionExpiredException] session_id:{session_id}')
+        super().__init__()
         self.session_id = session_id
-        super().__init__(session_id)
+        print(f'[{self.__class__.__name__}] session_id:{session_id} lineno:{self.lineno} func:{self.function}')
 
 
-class GameExpiredException(Exception):
+class GameExpiredException(BaseServerException):
     # Thrown when requested game (identified by game_id) does not exist
     # when on ACTIVE connection
     def __init__(self, game_id):
-        print(f'[GameExpiredException] game_id:{game_id}')
+        super().__init__()
         self.game_id = game_id
-        super().__init__(game_id)
+        print(f'[{self.__class__.__name__}] game_id:{game_id} lineno:{self.lineno} func:{self.function}')
 
 
 async def handler(websocket: WSConnection, _):
@@ -685,6 +726,13 @@ async def handler(websocket: WSConnection, _):
                     # and sends the latest game to all the active game connections
                     orchestrator.make_move(session_id, game_id, edge, websocket)
 
+                elif data['type'] == 'RESET_GAME':
+                    session_id = data['session_id']
+                    game_id = data['game_id']
+                    # Resets the game back to initial state, (new game with same set of players)
+                    # and sends the new game to all active connections
+                    orchestrator.reset_game(session_id, game_id, websocket)
+
                 elif data['type'] == 'EXIT_GAME':
                     session_id = data['session_id']
                     game_id = data['game_id']
@@ -702,6 +750,10 @@ async def handler(websocket: WSConnection, _):
                 await Send.game_expired(websocket, e.game_id)
             except DotsAndBoxesException:  # MAKE_MOVE
                 await Send.unauthorized(websocket, Send.GAME_EXCEPTION)
+
+    except json.decoder.JSONDecodeError:
+        # Invalid JSON
+        pass
 
     except ConnectionClosedError:
         # Gracefully handle connection closure
