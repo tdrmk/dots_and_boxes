@@ -5,7 +5,7 @@ import pygame
 import asyncio
 import websockets
 import json
-import os
+import re
 import ssl
 import socket
 import argparse
@@ -16,6 +16,7 @@ parser.add_argument('--password', type=str, default='password', help='Password')
 parser.add_argument('--uri', type=str, default='ws://localhost:8080', help='Server WebSocket URI')
 parser.add_argument("--signup", action="store_true", help="Sign up else login")
 parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+parser.add_argument("--insecure", action="store_true", help="Enable debug mode")
 args = parser.parse_args()
 
 URI = args.uri
@@ -23,6 +24,7 @@ USERNAME = args.username
 PASSWORD = args.password
 SIGNUP = bool(args.signup)  # else LOGIN
 DEBUG = bool(args.debug)
+INSECURE = bool(args.insecure)
 
 BACKGROUND = pygame.Color('#FFFFFF')
 FOREGROUND = pygame.Color('#000000')
@@ -357,7 +359,7 @@ class GameUI:
 
                     # If reconnection fails, exception is throw and loop breaks
                     await asyncio.sleep(10)
-                    self.websocket = await websockets.connect(URI)
+                    self.websocket = await establish_connection()
                     await self.websocket.send(json.dumps({
                         'type': 'LOGIN',
                         'username': USERNAME,
@@ -478,10 +480,17 @@ class GameUI:
             await asyncio.sleep(interval)
 
 
+async def establish_connection():
+    if INSECURE and re.match('^wss', URI):
+        return await websockets.connect(URI, ssl=ssl._create_unverified_context())
+    else:
+        return await websockets.connect(URI)
+
+
 async def main():
     websocket = None
     try:
-        websocket = await websockets.connect(URI)
+        websocket = await establish_connection()
         message_type = 'SIGN_UP' if SIGNUP else 'LOGIN'
         await websocket.send(json.dumps({'type': message_type, 'username': USERNAME, 'password': PASSWORD}))
         result = json.loads(await websocket.recv())
@@ -524,10 +533,13 @@ async def main():
     except ssl.SSLCertVerificationError:
         print("Certification verification failed. Please update your CA certificates.")
         print("run `pip3 install --upgrade certifi`")
+        print("OR run the `client.py` with `--insecure` flag")
     except InvalidStatusCode:
         print("Server not found, please double check the URI")
     except socket.gaierror:
-        print("Server not found, please double check the URI")
+        print("Address resolution failed, please check the URI and your network connection.")
+    except OSError:
+        print('Make sure server is running')
 
     finally:
         # Game handles connection closure if game started.
