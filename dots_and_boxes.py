@@ -1,7 +1,9 @@
+from __future__ import annotations
 from dataclasses import dataclass
 from collections import defaultdict
 from typing import List, Set, Dict, DefaultDict
 from commons import HexPickleSerializer
+import json
 
 
 # Grid is used to indicate the size of dots and boxes board
@@ -55,6 +57,13 @@ class Edge(HexPickleSerializer):
             return Box.from_end(self.end),
         else:
             return Box(self.start), Box.from_end(self.end)
+
+    def encode(self) -> str:
+        return json.dumps(self, cls=DotsAndBoxesJSONEncoder)
+
+    @classmethod
+    def decode(cls, data: str):
+        return json.loads(data, cls=DotsAndBoxesJSONDecoder)
 
 
 @dataclass(frozen=True, order=True)
@@ -201,6 +210,31 @@ class DotsAndBoxes(HexPickleSerializer):
     def score(self, player):
         return len(self._won_boxes[player])
 
+    def encode(self) -> str:
+        return json.dumps(self, cls=DotsAndBoxesJSONEncoder)
+
+    @classmethod
+    def decode(cls, data: str) -> DotsAndBoxes:
+        return json.loads(data, cls=DotsAndBoxesJSONDecoder)
+
+    # Properties used by JSON decoder and encoder
+    # NOTE: Not to be used elsewhere
+    @property
+    def turn(self) -> int:
+        return self._turn
+
+    @property
+    def pending_boxes(self) -> Dict[Box, int]:
+        return self._pending_boxes
+
+    @property
+    def chosen_edges(self) -> DefaultDict[Player, Set[Edge]]:
+        return self._chosen_edges
+
+    @property
+    def won_boxes(self) -> DefaultDict[Player, Set[Box]]:
+        return self._won_boxes
+
 
 class DotsAndBoxesException(Exception):
     # The exception is typically thrown when invalid move is made
@@ -209,3 +243,79 @@ class DotsAndBoxesException(Exception):
         super().__init__(message)
         print(f'[DotsAndBoxesException] {message}')
         self.message = message
+
+
+class DotsAndBoxesJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Grid) or \
+                isinstance(obj, Dot) or \
+                isinstance(obj, Edge) or \
+                isinstance(obj, Box) or \
+                isinstance(obj, Player):
+            # Dataclasses with serializable keys and public properties
+            return {'__class__': obj.__class__.__name__, **obj.__dict__}
+        elif isinstance(obj, DotsAndBoxes):
+            # DotsAndBoxes have objects as keys, and private properties
+            # So needs additional serialization effort
+            return {
+                '__class__': DotsAndBoxes.__name__,
+                'grid': obj.grid,
+                'players': obj.players,
+                'turn': obj.turn,
+                'last_move': obj.last_move,
+                # Internal states needing transformation to make it valid JSON
+                'pending_edges': list(obj.pending_edges),
+                'pending_boxes': list(
+                    map(lambda box: [box, obj.pending_boxes[box]], obj.pending_boxes),
+                ),
+                # Note: Iterating over players, as default dict is used
+                'chosen_edges': list(
+                    map(lambda player: [player, list(obj.chosen_edges[player])], obj.players)
+                ),
+                'won_boxes': list(
+                    map(lambda player: [player, list(obj.won_boxes[player])], obj.players)
+                ),
+            }
+        # Default behaviour
+        return json.JSONEncoder.encode(self, obj)
+
+
+class DotsAndBoxesJSONDecoder(json.JSONDecoder):
+    classes = {
+        Grid.__name__: Grid,
+        Dot.__name__: Dot,
+        Edge.__name__: Edge,
+        Box.__name__: Box,
+        Player.__name__: Player
+    }
+
+    def __init__(self, *args, **kwargs):
+        # Documentation: object_hook, if specified, will be called with the result of every JSON object decoded and
+        # its return value will be used in place of the given dict.
+        json.JSONDecoder.__init__(self, object_hook=self.object_hook, *args, **kwargs)
+
+    def object_hook(self, dct: dict):
+        if '__class__' in dct:
+            dct = dct.copy()  # Create a shallow copy so not to not modify the input params
+            if dct['__class__'] in [
+                Grid.__name__,
+                Dot.__name__,
+                Edge.__name__,
+                Box.__name__,
+                Player.__name__
+            ]:
+                # Handled namedtuple/dataclasses based objects
+                class_name = dct.pop('__class__')
+                return self.classes[class_name](**dct)
+            elif dct['__class__'] == DotsAndBoxes.__name__:
+                # Create a new object and update its private properties
+                game = DotsAndBoxes(dct['players'], dct['grid'])
+                game._turn = dct['turn']
+                game._last_move = dct['last_move']
+                game._pending_edges = set(dct['pending_edges'])
+                game._pending_boxes = {box: count for box, count in dct['pending_boxes']}
+                game._chosen_edges = defaultdict(set, {player: set(edges) for player, edges in dct['chosen_edges']})
+                game._won_boxes = defaultdict(set, {player: set(boxes) for player, boxes in dct['won_boxes']})
+                return game
+        # Just return unknown values
+        return dct
