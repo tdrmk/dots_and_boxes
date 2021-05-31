@@ -328,9 +328,6 @@ class GameUI:
                             # Make sure to check the game
                             self.game = None
 
-                        # Just in case, not sure if its required
-                        self.pending_new_request = False
-
                     elif response['type'] == 'PLAYER_STATUS':
                         print("Updated player status...")
                         if self.game_id == response['game_id']:
