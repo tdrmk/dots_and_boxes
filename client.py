@@ -284,7 +284,7 @@ class GameUI:
             await asyncio.sleep(600)    # 10 minutes (heroku idling time 30 minutes)
             try:
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(url) as response:
+                    async with session.get(url, ssl=False) as response:
                         print(f'Server health status: {response.status} {response.reason}')
 
             except ClientError as e:
