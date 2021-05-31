@@ -13,14 +13,14 @@ class Grid:
 
 
 # Indicates a dot on the board
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class Dot:
     x: int
     y: int
 
 
 # adjacent dots on grid are joined to form an edge
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class Edge(HexPickleSerializer):
     start: Dot
     end: Dot
@@ -57,7 +57,7 @@ class Edge(HexPickleSerializer):
             return Box(self.start), Box.from_end(self.end)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, order=True)
 class Box:
     start: Dot
 

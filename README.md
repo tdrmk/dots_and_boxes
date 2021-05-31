@@ -25,3 +25,6 @@ Username and Password must have lengths between 4 and 9 and can contain only alp
 Use ```--signup``` flag while running the command first time. Its not needed subsequent times.
 
 In case SSL Certificate Verification error, pass ```--insecure``` flag while running the client. 
+
+NOTE:  Game has an IDLE_TIMEOUT of 5 minutes (game expires if no move is made in that time)
+and Game has a MAX_TIMEOUT of 15 minutes (game can last at max 15 min), as defined in ```server.py```.

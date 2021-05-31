@@ -1,6 +1,6 @@
 from dots_and_boxes import *
 from websockets import WebSocketClientProtocol as WSConnection, InvalidURI, InvalidStatusCode
-
+from urllib.parse import urljoin
 import pygame
 import asyncio
 import websockets
@@ -9,6 +9,7 @@ import re
 import ssl
 import socket
 import argparse
+import aiohttp
 
 parser = argparse.ArgumentParser(description='Game client')
 parser.add_argument('--username', type=str, default='username', help='Username')
@@ -274,6 +275,17 @@ class GameUI:
         rect.center = (self.width // 2, self.height - 100)
         self.win.blit(text, rect)
 
+    async def keep_alive_ping(self):
+        # Construct the HTTP GET health URL of the server
+        url = urljoin(re.sub('^ws', 'http', URI), '/health')
+        while self.run:
+            # To prevent heroku from idling, periodically make a request to the client when game is active
+            await asyncio.sleep(600)    # 10 minutes (heroku idling time 30 minutes)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    status = await response.text()
+                    print(f'Server health status {status.strip()}')
+
     async def consume_messages(self):
         attempt_reconnect = False
         while self.run:
@@ -372,6 +384,8 @@ class GameUI:
 
         # Updates based on server messages
         asyncio.create_task(self.consume_messages())
+        # Periodically ping the server, just to keep it alive (prevent Heroku idling)
+        asyncio.create_task(self.keep_alive_ping())
 
         while self.run:
 
