@@ -1,6 +1,7 @@
 from dots_and_boxes import *
 from websockets import WebSocketClientProtocol as WSConnection, InvalidURI, InvalidStatusCode
 from urllib.parse import urljoin
+from aiohttp.client_exceptions import ClientError
 import pygame
 import asyncio
 import websockets
@@ -281,10 +282,15 @@ class GameUI:
         while self.run:
             # To prevent heroku from idling, periodically make a request to the client when game is active
             await asyncio.sleep(600)    # 10 minutes (heroku idling time 30 minutes)
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
-                    status = await response.text()
-                    print(f'Server health status {status.strip()}')
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as response:
+                        print(f'Server health status: {response.status} {response.reason}')
+
+            except ClientError as e:
+                print('Server health status: Error: ', e.__class__.__name__)
+            except OSError:
+                print('Server health status: server is not running')
 
     async def consume_messages(self):
         attempt_reconnect = False
