@@ -5,6 +5,7 @@ import asyncio
 import websockets
 import os
 import inspect
+import http
 
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
@@ -763,7 +764,12 @@ async def handler(websocket: WSConnection, _):
         orchestrator.unregister(websocket)
 
 
-orchestrator = Orchestrator()
-start_server = websockets.serve(handler, HOST, PORT)
-asyncio.get_event_loop().run_until_complete(start_server)
-asyncio.get_event_loop().run_forever()
+async def health_check(path, request_headers):
+    if path == "/health":
+        return http.HTTPStatus.OK, {}, b"OK\n"
+
+if __name__ == '__main__':
+    orchestrator = Orchestrator()
+    start_server = websockets.serve(handler, HOST, PORT, process_request=health_check)
+    asyncio.get_event_loop().run_until_complete(start_server)
+    asyncio.get_event_loop().run_forever()
