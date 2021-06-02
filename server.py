@@ -11,7 +11,8 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
 from websockets import WebSocketServerProtocol as WSConnection
 from websockets.exceptions import ConnectionClosedError
-from dots_and_boxes import Grid, Player, DotsAndBoxes, Edge, DotsAndBoxesException
+from dots_and_boxes import Grid, Player, DotsAndBoxes, Edge, DotsAndBoxesException, DotsAndBoxesJSONDecoder, \
+    DotsAndBoxesJSONEncoder
 
 USERNAME_REGEX = r'^\w{4,9}$'
 PASSWORD_REGEX = r'^\w{4,9}$'
@@ -296,9 +297,9 @@ class Game:
         return self._game_id
 
     @property
-    def data(self):
-        # Returns the serialized version of the game
-        return self._game.encode()
+    def game(self):
+        # Note: Only to be used while sending the game
+        return self._game
 
     @property
     def game_over(self):
@@ -454,9 +455,9 @@ class Send:
         await websocket.send(json.dumps({
             'type': 'GAME',
             'game_id': game.game_id,
-            'game_data': game.data,
+            'game_data': game.game,
             'player_status': game.session_status,
-        }))
+        }, cls=DotsAndBoxesJSONEncoder))
 
     @staticmethod
     async def player_status(websocket: WSConnection, game: Game):
@@ -676,7 +677,7 @@ async def handler(websocket: WSConnection, _):
     try:
         # Consumer modal
         async for message in websocket:
-            data = json.loads(message)
+            data = json.loads(message, cls=DotsAndBoxesJSONDecoder)
             try:
                 # Session Management requests
                 if data['type'] == 'SIGN_UP':
@@ -722,7 +723,7 @@ async def handler(websocket: WSConnection, _):
                 elif data['type'] == 'MAKE_MOVE':
                     session_id = data['session_id']
                     game_id = data['game_id']
-                    edge = Edge.decode(data['edge_data'])
+                    edge = data['edge_data']
                     # Makes all the checks and actions of GET_GAME, and makes the move
                     # and sends the latest game to all the active game connections
                     orchestrator.make_move(session_id, game_id, edge, websocket)
@@ -767,6 +768,7 @@ async def handler(websocket: WSConnection, _):
 async def health_check(path, request_headers):
     if path == "/health":
         return http.HTTPStatus.OK, {}, b"OK\n"
+
 
 if __name__ == '__main__':
     orchestrator = Orchestrator()

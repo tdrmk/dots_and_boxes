@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections import defaultdict
 from typing import List, Set, Dict, DefaultDict
-from commons import HexPickleSerializer
 import json
 
 
@@ -23,7 +22,7 @@ class Dot:
 
 # adjacent dots on grid are joined to form an edge
 @dataclass(frozen=True, order=True)
-class Edge(HexPickleSerializer):
+class Edge:
     start: Dot
     end: Dot
 
@@ -58,13 +57,6 @@ class Edge(HexPickleSerializer):
         else:
             return Box(self.start), Box.from_end(self.end)
 
-    def encode(self) -> str:
-        return json.dumps(self, cls=DotsAndBoxesJSONEncoder)
-
-    @classmethod
-    def decode(cls, data: str):
-        return json.loads(data, cls=DotsAndBoxesJSONDecoder)
-
 
 @dataclass(frozen=True, order=True)
 class Box:
@@ -90,7 +82,7 @@ class Player:
 
 
 # The Game
-class DotsAndBoxes(HexPickleSerializer):
+class DotsAndBoxes:
     def __init__(self, players: List[Player], grid=Grid(5, 5)):
         if len(players) < 2:
             raise DotsAndBoxesException('Insufficient number of players')
@@ -209,13 +201,6 @@ class DotsAndBoxes(HexPickleSerializer):
 
     def score(self, player):
         return len(self._won_boxes[player])
-
-    def encode(self) -> str:
-        return json.dumps(self, cls=DotsAndBoxesJSONEncoder)
-
-    @classmethod
-    def decode(cls, data: str) -> DotsAndBoxes:
-        return json.loads(data, cls=DotsAndBoxesJSONDecoder)
 
     # Properties used by JSON decoder and encoder
     # NOTE: Not to be used elsewhere

@@ -298,7 +298,7 @@ class GameUI:
             try:
                 async for message in self.websocket:
                     # Handle messages from active connection
-                    response = json.loads(message)
+                    response = json.loads(message, cls=DotsAndBoxesJSONDecoder)
 
                     if response['type'] == 'AUTHENTICATED':
                         print("Authenticated!")
@@ -332,7 +332,7 @@ class GameUI:
                         # TODO: Make sure to check if its the right game
                         print("Got game from server...")
                         self.game_id = response['game_id']
-                        self.game: DotsAndBoxes = DotsAndBoxes.decode(response['game_data'])
+                        self.game: DotsAndBoxes = response['game_data']
                         statuses = response['player_status']
                         for player in self.game.players:
                             self.connection_status[player] = statuses[self.game.index(player)]
@@ -341,7 +341,7 @@ class GameUI:
                         self.pending_new_request = False
 
                     elif response['type'] == 'GAME_EXPIRED':
-                        print("Game expired!")
+                        print(f"Game expired {response['game_id']}!")
                         if self.game_id == response['game_id']:
                             # Make sure to check the game
                             self.game = None
@@ -427,8 +427,8 @@ class GameUI:
                                             'type': 'MAKE_MOVE',
                                             'session_id': self.session_id,
                                             'game_id': self.game_id,
-                                            'edge_data': edge.edge.encode(),
-                                        })))
+                                            'edge_data': edge.edge,
+                                        }, cls=DotsAndBoxesJSONEncoder)))
 
                     # In case user is not sure if game is running or does not know status of the game
                     if event.type == pygame.KEYDOWN and event.key == pygame.K_l:
@@ -522,12 +522,12 @@ async def main():
             print('WAITING FOR ENOUGH PLAYERS TO JOIN!')
 
             while True:
-                result = json.loads(await websocket.recv())
+                result = json.loads(await websocket.recv(), cls=DotsAndBoxesJSONDecoder)
                 if result['type'] == 'GAME':
                     print('Starting game!')
                     # Get the game details from server
                     game_id = result['game_id']
-                    game = DotsAndBoxes.decode(result['game_data'])
+                    game = result['game_data']
                     async with GameUI(game, websocket, session_id=session_id, game_id=game_id,
                                       user_id=user_id) as game_ui:
                         await game_ui.game_loop()
